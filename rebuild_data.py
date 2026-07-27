@@ -9,6 +9,7 @@ import numpy as np
 import nltk
 # pyrefly: ignore [missing-import]
 from nltk.corpus import stopwords
+# pyrefly: ignore [missing-import]
 from nltk.stem import WordNetLemmatizer
 from sklearn.feature_extraction.text import TfidfVectorizer
 
