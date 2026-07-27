@@ -1,11 +1,12 @@
+import os
 import requests
 import streamlit as st
 
 # =============================
 # CONFIG
 # =============================
-API_BASE = "https://movie-rec-466x.onrender.com" or "http://127.0.0.1:8000"
-TMDB_IMG = "https://image.tmdb.org/t/p/w500"
+API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
+# OMDB returns full poster URLs directly
 
 st.set_page_config(page_title="Movie Recommender", page_icon="🎬", layout="wide")
 
@@ -29,8 +30,8 @@ st.markdown(
 # =============================
 if "view" not in st.session_state:
     st.session_state.view = "home"  # home | details
-if "selected_tmdb_id" not in st.session_state:
-    st.session_state.selected_tmdb_id = None
+if "selected_imdb_id" not in st.session_state:
+    st.session_state.selected_imdb_id = None
 
 qp_view = st.query_params.get("view")
 qp_id = st.query_params.get("id")
@@ -38,7 +39,7 @@ if qp_view in ("home", "details"):
     st.session_state.view = qp_view
 if qp_id:
     try:
-        st.session_state.selected_tmdb_id = int(qp_id)
+        st.session_state.selected_imdb_id = str(qp_id)
         st.session_state.view = "details"
     except:
         pass
@@ -52,11 +53,11 @@ def goto_home():
     st.rerun()
 
 
-def goto_details(tmdb_id: int):
+def goto_details(imdb_id: str):
     st.session_state.view = "details"
-    st.session_state.selected_tmdb_id = int(tmdb_id)
+    st.session_state.selected_imdb_id = str(imdb_id)
     st.query_params["view"] = "details"
-    st.query_params["id"] = str(int(tmdb_id))
+    st.query_params["id"] = str(imdb_id)
     st.rerun()
 
 
@@ -89,7 +90,7 @@ def poster_grid(cards, cols=6, key_prefix="grid"):
             m = cards[idx]
             idx += 1
 
-            tmdb_id = m.get("tmdb_id")
+            imdb_id = m.get("imdb_id")
             title = m.get("title", "Untitled")
             poster = m.get("poster_url")
 
@@ -99,9 +100,9 @@ def poster_grid(cards, cols=6, key_prefix="grid"):
                 else:
                     st.write("🖼️ No poster")
 
-                if st.button("Open", key=f"{key_prefix}_{r}_{c}_{idx}_{tmdb_id}"):
-                    if tmdb_id:
-                        goto_details(tmdb_id)
+                if st.button("Open", key=f"{key_prefix}_{r}_{c}_{idx}_{imdb_id}"):
+                    if imdb_id:
+                        goto_details(imdb_id)
 
                 st.markdown(
                     f"<div class='movie-title'>{title}</div>", unsafe_allow_html=True
@@ -111,48 +112,48 @@ def poster_grid(cards, cols=6, key_prefix="grid"):
 def to_cards_from_tfidf_items(tfidf_items):
     cards = []
     for x in tfidf_items or []:
-        tmdb = x.get("tmdb") or {}
-        if tmdb.get("tmdb_id"):
+        omdb = x.get("omdb") or {}
+        if omdb.get("imdb_id"):
             cards.append(
                 {
-                    "tmdb_id": tmdb["tmdb_id"],
-                    "title": tmdb.get("title") or x.get("title") or "Untitled",
-                    "poster_url": tmdb.get("poster_url"),
+                    "imdb_id": omdb["imdb_id"],
+                    "title": omdb.get("title") or x.get("title") or "Untitled",
+                    "poster_url": omdb.get("poster_url"),
                 }
             )
     return cards
 
 
 # =============================
-# IMPORTANT: Robust TMDB search parsing
+# IMPORTANT: Robust OMDB search parsing
 # Supports BOTH API shapes:
-# 1) raw TMDB: {"results":[{id,title,poster_path,...}]}
-# 2) list cards: [{tmdb_id,title,poster_url,...}]
+# 1) raw OMDB: {"Search":[{Title,Year,imdbID,Poster,...}]}
+# 2) list cards: [{imdb_id,title,poster_url,...}]
 # =============================
-def parse_tmdb_search_to_cards(data, keyword: str, limit: int = 24):
+def parse_omdb_search_to_cards(data, keyword: str, limit: int = 24):
     """
     Returns:
-      suggestions: list[(label, tmdb_id)]
-      cards: list[{tmdb_id,title,poster_url}]
+      suggestions: list[(label, imdb_id)]
+      cards: list[{imdb_id,title,poster_url}]
     """
     keyword_l = keyword.strip().lower()
 
-    # A) If API returns dict with 'results'
-    if isinstance(data, dict) and "results" in data:
-        raw = data.get("results") or []
+    # A) If API returns dict with 'Search'
+    if isinstance(data, dict) and "Search" in data:
+        raw = data.get("Search") or []
         raw_items = []
         for m in raw:
-            title = (m.get("title") or "").strip()
-            tmdb_id = m.get("id")
-            poster_path = m.get("poster_path")
-            if not title or not tmdb_id:
+            title = (m.get("Title") or "").strip()
+            imdb_id = m.get("imdbID")
+            poster = m.get("Poster")
+            if not title or not imdb_id:
                 continue
             raw_items.append(
                 {
-                    "tmdb_id": int(tmdb_id),
+                    "imdb_id": str(imdb_id),
                     "title": title,
-                    "poster_url": f"{TMDB_IMG}{poster_path}" if poster_path else None,
-                    "release_date": m.get("release_date", ""),
+                    "poster_url": poster if poster != "N/A" else None,
+                    "release_date": m.get("Year", ""),
                 }
             )
 
@@ -160,15 +161,15 @@ def parse_tmdb_search_to_cards(data, keyword: str, limit: int = 24):
     elif isinstance(data, list):
         raw_items = []
         for m in data:
-            # might be {tmdb_id,title,poster_url}
-            tmdb_id = m.get("tmdb_id") or m.get("id")
+            # might be {imdb_id,title,poster_url}
+            imdb_id = m.get("imdb_id") or m.get("id")
             title = (m.get("title") or "").strip()
             poster_url = m.get("poster_url")
-            if not title or not tmdb_id:
+            if not title or not imdb_id:
                 continue
             raw_items.append(
                 {
-                    "tmdb_id": int(tmdb_id),
+                    "imdb_id": str(imdb_id),
                     "title": title,
                     "poster_url": poster_url,
                     "release_date": m.get("release_date", ""),
@@ -188,11 +189,11 @@ def parse_tmdb_search_to_cards(data, keyword: str, limit: int = 24):
     for x in final_list[:10]:
         year = (x.get("release_date") or "")[:4]
         label = f"{x['title']} ({year})" if year else x["title"]
-        suggestions.append((label, x["tmdb_id"]))
+        suggestions.append((label, x["imdb_id"]))
 
     # Cards = top N
     cards = [
-        {"tmdb_id": x["tmdb_id"], "title": x["title"], "poster_url": x["poster_url"]}
+        {"imdb_id": x["imdb_id"], "title": x["title"], "poster_url": x["poster_url"]}
         for x in final_list[:limit]
     ]
     return suggestions, cards
@@ -245,7 +246,7 @@ if st.session_state.view == "home":
             if err or data is None:
                 st.error(f"Search failed: {err}")
             else:
-                suggestions, cards = parse_tmdb_search_to_cards(
+                suggestions, cards = parse_omdb_search_to_cards(
                     data, typed.strip(), limit=24
                 )
 
@@ -282,8 +283,8 @@ if st.session_state.view == "home":
 # VIEW: DETAILS
 # ==========================================================
 elif st.session_state.view == "details":
-    tmdb_id = st.session_state.selected_tmdb_id
-    if not tmdb_id:
+    imdb_id = st.session_state.selected_imdb_id
+    if not imdb_id:
         st.warning("No movie selected.")
         if st.button("← Back to Home"):
             goto_home()
@@ -297,8 +298,9 @@ elif st.session_state.view == "details":
         if st.button("← Back to Home"):
             goto_home()
 
-    # Details (your FastAPI safe route)
-    data, err = api_get_json(f"/movie/id/{tmdb_id}")
+    data, err = api_get_json(
+        f"/movie/id/{imdb_id}" if imdb_id else None
+    )
     if err or not data:
         st.error(f"Could not load details: {err or 'Unknown error'}")
         st.stop()
@@ -318,7 +320,7 @@ elif st.session_state.view == "details":
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.markdown(f"## {data.get('title','')}")
         release = data.get("release_date") or "-"
-        genres = ", ".join([g["name"] for g in data.get("genres", [])]) or "-"
+        genres = ", ".join(data.get("genres", [])) or "-"
         st.markdown(
             f"<div class='small-muted'>Release: {release}</div>", unsafe_allow_html=True
         )
@@ -329,10 +331,6 @@ elif st.session_state.view == "details":
         st.markdown("### Overview")
         st.write(data.get("overview") or "No overview available.")
         st.markdown("</div>", unsafe_allow_html=True)
-
-    if data.get("backdrop_url"):
-        st.markdown("#### Backdrop")
-        st.image(data["backdrop_url"], use_column_width=True)
 
     st.divider()
     st.markdown("### ✅ Recommendations")
@@ -362,7 +360,7 @@ elif st.session_state.view == "details":
         else:
             st.info("Showing Genre recommendations (fallback).")
             genre_only, err3 = api_get_json(
-                "/recommend/genre", params={"tmdb_id": tmdb_id, "limit": 18}
+                "/recommend/genre", params={"imdb_id": imdb_id, "limit": 18}
             )
             if not err3 and genre_only:
                 poster_grid(

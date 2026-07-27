@@ -1,5 +1,6 @@
 import os
 import pickle
+import asyncio
 from typing import Optional, List, Dict, Any, Tuple
 
 import numpy as np
@@ -15,14 +16,13 @@ from dotenv import load_dotenv
 # ENV
 # =========================
 load_dotenv()
-TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+OMDB_API_KEY = os.getenv("OMDB_API_KEY")
 
-TMDB_BASE = "https://api.themoviedb.org/3"
-TMDB_IMG_500 = "https://image.tmdb.org/t/p/w500"
+OMDB_BASE = "http://www.omdbapi.com/"
 
-if not TMDB_API_KEY:
+if not OMDB_API_KEY:
     # Don't crash import-time in production if you prefer; but for you better fail early:
-    raise RuntimeError("TMDB_API_KEY missing. Put it in .env as TMDB_API_KEY=xxxx")
+    raise RuntimeError("OMDB_API_KEY missing. Put it in .env as OMDB_API_KEY=xxxx")
 
 
 # =========================
@@ -37,6 +37,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 
 # =========================
@@ -60,35 +61,34 @@ TITLE_TO_IDX: Optional[Dict[str, int]] = None
 # =========================
 # MODELS
 # =========================
-class TMDBMovieCard(BaseModel):
-    tmdb_id: int
+class OMDBMovieCard(BaseModel):
+    imdb_id: str
     title: str
     poster_url: Optional[str] = None
     release_date: Optional[str] = None
     vote_average: Optional[float] = None
 
 
-class TMDBMovieDetails(BaseModel):
-    tmdb_id: int
+class OMDBMovieDetails(BaseModel):
+    imdb_id: str
     title: str
     overview: Optional[str] = None
     release_date: Optional[str] = None
     poster_url: Optional[str] = None
-    backdrop_url: Optional[str] = None
-    genres: List[dict] = []
+    genres: List[str] = []
 
 
 class TFIDFRecItem(BaseModel):
     title: str
     score: float
-    tmdb: Optional[TMDBMovieCard] = None
+    omdb: Optional[OMDBMovieCard] = None
 
 
 class SearchBundleResponse(BaseModel):
     query: str
-    movie_details: TMDBMovieDetails
+    movie_details: OMDBMovieDetails
     tfidf_recommendations: List[TFIDFRecItem]
-    genre_recommendations: List[TMDBMovieCard]
+    genre_recommendations: List[OMDBMovieCard]
 
 
 # =========================
@@ -98,87 +98,251 @@ def _norm_title(t: str) -> str:
     return str(t).strip().lower()
 
 
-def make_img_url(path: Optional[str]) -> Optional[str]:
-    if not path:
+def make_img_url(url: Optional[str]) -> Optional[str]:
+    """OMDB returns full poster URLs directly, or 'N/A' if not available."""
+    if not url or url == "N/A":
         return None
-    return f"{TMDB_IMG_500}{path}"
+    return url
 
 
-async def tmdb_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+def get_local_movie_details(imdb_id: str) -> Optional[OMDBMovieDetails]:
+    global df
+    if df is None:
+        return None
+    norm_id = str(imdb_id).strip().lower()
+    matches = df[df['imdb_id'].fillna('').astype(str).str.strip().str.lower() == norm_id]
+    if matches.empty:
+        return None
+    row = matches.iloc[0]
+    genres_str = row.get('genres', '')
+    genres = [g.strip() for g in genres_str.split() if g.strip()]
+    poster_path = row.get('poster_path')
+    poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path and str(poster_path) != "nan" else None
+    
+    return OMDBMovieDetails(
+        imdb_id=str(row.get('imdb_id', imdb_id)),
+        title=str(row.get('title', 'Untitled')),
+        overview=str(row.get('overview', '')),
+        release_date=str(row.get('release_date', '')),
+        poster_url=poster_url,
+        genres=genres
+    )
+
+
+def get_local_movie_card_by_title(title: str) -> Optional[OMDBMovieCard]:
+    global df
+    if df is None:
+        return None
+    norm_title = _norm_title(title)
+    matches = df[df['title'].fillna('').astype(str).str.strip().str.lower() == norm_title]
+    if matches.empty:
+        return None
+    row = matches.iloc[0]
+    poster_path = row.get('poster_path')
+    poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path and str(poster_path) != "nan" else None
+    return OMDBMovieCard(
+        imdb_id=str(row.get('imdb_id', '')),
+        title=str(row.get('title', title)),
+        poster_url=poster_url,
+        release_date=str(row.get('release_date', '')),
+        vote_average=float(row.get('vote_average', 0.0))
+    )
+
+
+# In-memory poster cache to avoid redundant network requests
+POSTER_CACHE: Dict[str, str] = {}
+
+
+async def verify_and_get_poster(title: str, imdb_id: str, local_path: Optional[str]) -> Optional[str]:
+    global POSTER_CACHE
+    
+    # 0. Check cache first
+    cache_key = str(imdb_id or title).strip().lower()
+    if cache_key in POSTER_CACHE:
+        return POSTER_CACHE[cache_key]
+
+    # 1. Try local TMDB path first
+    if local_path and str(local_path) != "nan" and str(local_path).strip():
+        url = f"https://image.tmdb.org/t/p/w500{local_path}"
+        try:
+            async with httpx.AsyncClient(timeout=3) as client:
+                r = await client.head(url)
+                if r.status_code == 200:
+                    POSTER_CACHE[cache_key] = url
+                    return url
+        except Exception:
+            pass
+
+    # 2. Keyless Free Movie DB API Fallback (using title)
+    if title and str(title).strip() and str(title) != "nan":
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(f"https://imdb.iamidiotareyoutoo.com/search?q={title}")
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("ok") and data.get("description"):
+                        results = data["description"]
+                        # Match exact IMDb ID
+                        for item in results:
+                            item_imdb = item.get("#IMDB_ID")
+                            if imdb_id and item_imdb and item_imdb.strip().lower() == imdb_id.strip().lower():
+                                poster = item.get("#IMG_POSTER")
+                                if poster and poster != "N/A":
+                                    POSTER_CACHE[cache_key] = poster
+                                    return poster
+                        # Fallback to the first matching title result
+                        poster = results[0].get("#IMG_POSTER")
+                        if poster and poster != "N/A":
+                            POSTER_CACHE[cache_key] = poster
+                            return poster
+        except Exception:
+            pass
+
+    # 3. Fallback to OMDB if configured
+    if imdb_id and str(imdb_id).strip() and str(imdb_id) != "nan" and OMDB_API_KEY and OMDB_API_KEY != "f0891f70":
+        try:
+            data = await omdb_get({"i": imdb_id})
+            poster = data.get("Poster")
+            if poster and poster != "N/A":
+                POSTER_CACHE[cache_key] = poster
+                return poster
+        except Exception:
+            pass
+
+    return None
+
+
+async def local_genre_recommend(imdb_id: str, limit: int = 18) -> List[OMDBMovieCard]:
+    global df
+    if df is None:
+        return []
+    
+    norm_id = str(imdb_id).strip().lower()
+    matches = df[df['imdb_id'].fillna('').astype(str).str.strip().str.lower() == norm_id]
+    if matches.empty:
+        return []
+    
+    target_movie = matches.iloc[0]
+    target_genres_str = target_movie.get('genres', '')
+    target_genres = set(target_genres_str.split())
+    
+    if not target_genres:
+        return []
+    
+    overlap_scores = []
+    for idx, row in df.iterrows():
+        if str(row.get('imdb_id')) == target_movie.get('imdb_id'):
+            continue
+        row_genres = set(str(row.get('genres', '')).split())
+        overlap = len(target_genres.intersection(row_genres))
+        if overlap > 0:
+            popularity = float(row.get('popularity', 0.0))
+            overlap_scores.append((idx, overlap, popularity))
+            
+    if not overlap_scores:
+        return []
+    
+    overlap_scores.sort(key=lambda x: (x[1], x[2]), reverse=True)
+    
+    async def build_card(idx):
+        row = df.iloc[idx]
+        row_imdb = str(row.get('imdb_id', ''))
+        poster_path = row.get('poster_path')
+        poster_url = await verify_and_get_poster(str(row.get('title', '')), row_imdb, poster_path)
+        return OMDBMovieCard(
+            imdb_id=row_imdb,
+            title=str(row.get('title', '')),
+            poster_url=poster_url,
+            release_date=str(row.get('release_date', '')),
+            vote_average=float(row.get('vote_average', 0.0))
+        )
+        
+    tasks = [build_card(idx) for idx, overlap, pop in overlap_scores[:limit]]
+    return await asyncio.gather(*tasks)
+
+
+async def omdb_get(params: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Safe TMDB GET:
+    Safe OMDB GET:
     - Network errors -> 502
-    - TMDB API errors -> 502 with detail
+    - OMDB API errors -> 502 with detail
     """
     q = dict(params)
-    q["api_key"] = TMDB_API_KEY
+    q["apikey"] = OMDB_API_KEY
 
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.get(f"{TMDB_BASE}{path}", params=q)
+            r = await client.get(OMDB_BASE, params=q)
     except httpx.RequestError as e:
         raise HTTPException(
             status_code=502,
-            detail=f"TMDB request error: {type(e).__name__} | {repr(e)}",
+            detail=f"OMDB request error: {type(e).__name__} | {repr(e)}",
         )
 
     if r.status_code != 200:
         raise HTTPException(
-            status_code=502, detail=f"TMDB error {r.status_code}: {r.text}"
+            status_code=502, detail=f"OMDB error {r.status_code}: {r.text}"
         )
 
-    return r.json()
+    data = r.json()
+    if data.get("Response") == "False":
+        raise HTTPException(
+            status_code=404, detail=f"OMDB: {data.get('Error', 'Unknown error')}"
+        )
+    return data
 
 
-async def tmdb_cards_from_results(
+async def omdb_cards_from_results(
     results: List[dict], limit: int = 20
-) -> List[TMDBMovieCard]:
-    out: List[TMDBMovieCard] = []
+) -> List[OMDBMovieCard]:
+    out: List[OMDBMovieCard] = []
     for m in (results or [])[:limit]:
         out.append(
-            TMDBMovieCard(
-                tmdb_id=int(m["id"]),
-                title=m.get("title") or m.get("name") or "",
-                poster_url=make_img_url(m.get("poster_path")),
-                release_date=m.get("release_date"),
-                vote_average=m.get("vote_average"),
+            OMDBMovieCard(
+                imdb_id=m.get("imdbID") or "",
+                title=m.get("Title") or "",
+                poster_url=make_img_url(m.get("Poster")),
+                release_date=m.get("Year"),
+                vote_average=None,
             )
         )
     return out
 
 
-async def tmdb_movie_details(movie_id: int) -> TMDBMovieDetails:
-    data = await tmdb_get(f"/movie/{movie_id}", {"language": "en-US"})
-    return TMDBMovieDetails(
-        tmdb_id=int(data["id"]),
-        title=data.get("title") or "",
-        overview=data.get("overview"),
-        release_date=data.get("release_date"),
-        poster_url=make_img_url(data.get("poster_path")),
-        backdrop_url=make_img_url(data.get("backdrop_path")),
-        genres=data.get("genres", []) or [],
+async def omdb_movie_details(imdb_id: str) -> OMDBMovieDetails:
+    """Fetch movie details from OMDB by IMDb ID."""
+    data = await omdb_get({"i": imdb_id, "type": "movie", "plot": "full"})
+    # Parse genres (OMDB returns comma-separated string)
+    genres_str = data.get("Genre", "")
+    genres = [g.strip() for g in genres_str.split(",") if g.strip()]
+    return OMDBMovieDetails(
+        imdb_id=data.get("imdbID") or imdb_id,
+        title=data.get("Title") or "",
+        overview=data.get("Plot"),
+        release_date=data.get("Year"),
+        poster_url=make_img_url(data.get("Poster")),
+        genres=genres,
     )
 
 
-async def tmdb_search_movies(query: str, page: int = 1) -> Dict[str, Any]:
+async def omdb_search_movies(query: str, page: int = 1) -> Dict[str, Any]:
     """
-    Raw TMDB response for keyword search (MULTIPLE results).
-    Streamlit will use this for suggestions and grid.
+    Search OMDB for movies by title.
+    OMDB returns: {Search: [{Title, Year, imdbID, Type, Poster}, ...], Response, totalResults}
     """
-    return await tmdb_get(
-        "/search/movie",
+    return await omdb_get(
         {
-            "query": query,
-            "include_adult": "false",
-            "language": "en-US",
+            "s": query,
+            "type": "movie",
             "page": page,
         },
     )
 
 
-async def tmdb_search_first(query: str) -> Optional[dict]:
-    data = await tmdb_search_movies(query=query, page=1)
-    results = data.get("results", [])
+async def omdb_search_first(query: str) -> Optional[dict]:
+    """Return first search result from OMDB."""
+    data = await omdb_search_movies(query=query, page=1)
+    results = data.get("Search", [])
     return results[0] if results else None
 
 
@@ -257,24 +421,43 @@ def tfidf_recommend_titles(
     return out
 
 
-async def attach_tmdb_card_by_title(title: str) -> Optional[TMDBMovieCard]:
+async def attach_omdb_card_by_title(title: str) -> Optional[OMDBMovieCard]:
     """
-    Uses TMDB search by title to fetch poster for a local title.
-    If not found, returns None (never crashes the endpoint).
+    Uses local lookup or OMDB search by title to fetch poster for a local title.
     """
-    try:
-        m = await tmdb_search_first(title)
-        if not m:
-            return None
-        return TMDBMovieCard(
-            tmdb_id=int(m["id"]),
-            title=m.get("title") or title,
-            poster_url=make_img_url(m.get("poster_path")),
-            release_date=m.get("release_date"),
-            vote_average=m.get("vote_average"),
-        )
-    except Exception:
+    global df
+    if df is None:
         return None
+    
+    norm_title = _norm_title(title)
+    matches = df[df['title'].fillna('').astype(str).str.strip().str.lower() == norm_title]
+    if matches.empty:
+        try:
+            m = await omdb_search_first(title)
+            if not m:
+                return None
+            return OMDBMovieCard(
+                imdb_id=m.get("imdbID") or "",
+                title=m.get("Title") or title,
+                poster_url=make_img_url(m.get("Poster")),
+                release_date=m.get("Year"),
+                vote_average=None,
+            )
+        except Exception:
+            return None
+            
+    row = matches.iloc[0]
+    imdb_id = str(row.get('imdb_id', ''))
+    poster_path = row.get('poster_path')
+    poster_url = await verify_and_get_poster(str(row.get('title', '')), imdb_id, poster_path)
+    
+    return OMDBMovieCard(
+        imdb_id=imdb_id,
+        title=str(row.get('title', title)),
+        poster_url=poster_url,
+        release_date=str(row.get('release_date', '')),
+        vote_average=float(row.get('vote_average', 0.0))
+    )
 
 
 # =========================
@@ -316,84 +499,118 @@ def health():
     return {"status": "ok"}
 
 
-# ---------- HOME FEED (TMDB) ----------
-@app.get("/home", response_model=List[TMDBMovieCard])
+# ---------- HOME FEED (Local Dataset discovery) ----------
+@app.get("/home", response_model=List[OMDBMovieCard])
 async def home(
     category: str = Query("popular"),
     limit: int = Query(24, ge=1, le=50),
 ):
     """
-    Home feed for Streamlit (posters).
-    category:
-      - trending (trending/movie/day)
-      - popular, top_rated, upcoming, now_playing  (movie/{category})
+    Home feed for Streamlit (posters), served locally.
+    Supports popular, trending, top_rated, now_playing, upcoming.
     """
-    try:
-        if category == "trending":
-            data = await tmdb_get("/trending/movie/day", {"language": "en-US"})
-            return await tmdb_cards_from_results(data.get("results", []), limit=limit)
+    global df
+    if df is None:
+        return []
+    
+    subset = df.copy()
+    
+    # Sort or filter based on category
+    if category in ("popular", "trending"):
+        subset = subset.sort_values(by="popularity", ascending=False)
+    elif category == "top_rated":
+        # require minimum vote count to avoid skewing by minor films
+        min_votes = 100
+        high_votes_subset = subset[subset['vote_count'] >= min_votes]
+        if high_votes_subset.empty:
+            high_votes_subset = subset
+        subset = high_votes_subset.sort_values(by="vote_average", ascending=False)
+    elif category in ("now_playing", "upcoming"):
+        # filter for valid year formats and sort by date/popularity
+        subset = subset[subset['release_date'].fillna('').astype(str).str.contains(r'^\d{4}')]
+        subset = subset.sort_values(by=["release_date", "popularity"], ascending=[False, False])
+    else:
+        subset = subset.sort_values(by="popularity", ascending=False)
+    
+    async def build_card(row):
+        row_imdb = str(row.get('imdb_id', ''))
+        poster_path = row.get('poster_path')
+        poster_url = await verify_and_get_poster(str(row.get('title', '')), row_imdb, poster_path)
+        return OMDBMovieCard(
+            imdb_id=row_imdb,
+            title=str(row.get('title', '')),
+            poster_url=poster_url,
+            release_date=str(row.get('release_date', '')),
+            vote_average=float(row.get('vote_average', 0.0))
+        )
+        
+    tasks = [build_card(row) for _, row in subset.head(limit).iterrows()]
+    return await asyncio.gather(*tasks)
 
-        if category not in {"popular", "top_rated", "upcoming", "now_playing"}:
-            raise HTTPException(status_code=400, detail="Invalid category")
 
-        data = await tmdb_get(f"/movie/{category}", {"language": "en-US", "page": 1})
-        return await tmdb_cards_from_results(data.get("results", []), limit=limit)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Home route failed: {e}")
-
-
-# ---------- TMDB KEYWORD SEARCH (MULTIPLE RESULTS) ----------
+# ---------- OMDB KEYWORD SEARCH WITH LOCAL FALLBACK ----------
 @app.get("/tmdb/search")
 async def tmdb_search(
     query: str = Query(..., min_length=1),
     page: int = Query(1, ge=1, le=10),
 ):
     """
-    Returns RAW TMDB shape with 'results' list.
-    Streamlit will use it for:
-      - dropdown suggestions
-      - grid results
+    Returns search results from OMDB, falling back to local titles if OMDB fails.
     """
-    return await tmdb_search_movies(query=query, page=page)
+    try:
+        return await omdb_search_movies(query=query, page=page)
+    except Exception as e:
+        # local search fallback
+        global df
+        if df is None:
+            raise e
+        query_l = query.strip().lower()
+        matches = df[df['title'].fillna('').astype(str).str.lower().str.contains(query_l)]
+        matches = matches.sort_values(by="popularity", ascending=False)
+        
+        limit = 10
+        start = (page - 1) * limit
+        paginated = matches.iloc[start:start+limit]
+        
+        results = []
+        for _, row in paginated.iterrows():
+            results.append({
+                "Title": str(row.get('title', '')),
+                "Year": str(row.get('release_date', ''))[:4],
+                "imdbID": str(row.get('imdb_id', '')),
+                "Type": "movie",
+                "Poster": f"https://image.tmdb.org/t/p/w500{row.get('poster_path')}" if row.get('poster_path') and str(row.get('poster_path')) != "nan" else "N/A"
+            })
+        return {
+            "Search": results,
+            "totalResults": str(len(matches)),
+            "Response": "True" if results else "False"
+        }
 
 
-# ---------- MOVIE DETAILS (SAFE ROUTE) ----------
-@app.get("/movie/id/{tmdb_id}", response_model=TMDBMovieDetails)
-async def movie_details_route(tmdb_id: int):
-    return await tmdb_movie_details(tmdb_id)
+# ---------- MOVIE DETAILS (WITH LOCAL FALLBACK) ----------
+@app.get("/movie/id/{imdb_id}", response_model=OMDBMovieDetails)
+async def movie_details_route(imdb_id: str):
+    try:
+        return await omdb_movie_details(imdb_id)
+    except Exception as e:
+        # local details lookup fallback
+        local_details = get_local_movie_details(imdb_id)
+        if local_details:
+            return local_details
+        raise e
 
 
-# ---------- GENRE RECOMMENDATIONS ----------
-@app.get("/recommend/genre", response_model=List[TMDBMovieCard])
+# ---------- LOCAL GENRE RECOMMENDATIONS ----------
+@app.get("/recommend/genre", response_model=List[OMDBMovieCard])
 async def recommend_genre(
-    tmdb_id: int = Query(...),
+    imdb_id: str = Query(...),
     limit: int = Query(18, ge=1, le=50),
 ):
     """
-    Given a TMDB movie ID:
-    - fetch details
-    - pick first genre
-    - discover movies in that genre (popular)
+    Return local genre-based movie recommendations.
     """
-    details = await tmdb_movie_details(tmdb_id)
-    if not details.genres:
-        return []
-
-    genre_id = details.genres[0]["id"]
-    discover = await tmdb_get(
-        "/discover/movie",
-        {
-            "with_genres": genre_id,
-            "language": "en-US",
-            "sort_by": "popularity.desc",
-            "page": 1,
-        },
-    )
-    cards = await tmdb_cards_from_results(discover.get("results", []), limit=limit)
-    return [c for c in cards if c.tmdb_id != tmdb_id]
+    return await local_genre_recommend(imdb_id, limit)
 
 
 # ---------- TF-IDF ONLY (debug/useful) ----------
@@ -417,56 +634,58 @@ async def search_bundle(
     This endpoint is for when you have a selected movie and want:
       - movie details
       - TF-IDF recommendations (local) + posters
-      - Genre recommendations (TMDB) + posters
-
-    NOTE:
-    - It selects the BEST match from TMDB for the given query.
-    - If you want MULTIPLE matches, use /tmdb/search
+      - Genre recommendations (local) + posters
     """
-    best = await tmdb_search_first(query)
-    if not best:
+    # Try fetching details from OMDB first, fallback to local lookup by title query
+    imdb_id = None
+    details = None
+    
+    try:
+        best = await omdb_search_first(query)
+        if best:
+            imdb_id = best.get("imdbID")
+            if imdb_id:
+                details = await omdb_movie_details(imdb_id)
+    except Exception:
+        pass
+        
+    if not details:
+        # Local fallback by title search
+        global df
+        if df is not None:
+            norm_q = _norm_title(query)
+            matches = df[df['title'].fillna('').astype(str).str.strip().str.lower() == norm_q]
+            if not matches.empty:
+                imdb_id = str(matches.iloc[0].get('imdb_id', ''))
+                if imdb_id:
+                    details = get_local_movie_details(imdb_id)
+
+    if not details:
         raise HTTPException(
-            status_code=404, detail=f"No TMDB movie found for query: {query}"
+            status_code=404, detail=f"No movie found locally or via OMDB for query: {query}"
         )
 
-    tmdb_id = int(best["id"])
-    details = await tmdb_movie_details(tmdb_id)
+    imdb_id = details.imdb_id
 
     # 1) TF-IDF recommendations (never crash endpoint)
     tfidf_items: List[TFIDFRecItem] = []
-
     recs: List[Tuple[str, float]] = []
     try:
-        # try local dataset by TMDB title
         recs = tfidf_recommend_titles(details.title, top_n=tfidf_top_n)
     except Exception:
-        # fallback to user query
         try:
             recs = tfidf_recommend_titles(query, top_n=tfidf_top_n)
         except Exception:
             recs = []
 
-    for title, score in recs:
-        card = await attach_tmdb_card_by_title(title)
-        tfidf_items.append(TFIDFRecItem(title=title, score=score, tmdb=card))
+    tasks = [attach_omdb_card_by_title(title) for title, score in recs]
+    cards = await asyncio.gather(*tasks)
+    
+    for (title, score), card in zip(recs, cards):
+        tfidf_items.append(TFIDFRecItem(title=title, score=score, omdb=card))
 
-    # 2) Genre recommendations (TMDB discover by first genre)
-    genre_recs: List[TMDBMovieCard] = []
-    if details.genres:
-        genre_id = details.genres[0]["id"]
-        discover = await tmdb_get(
-            "/discover/movie",
-            {
-                "with_genres": genre_id,
-                "language": "en-US",
-                "sort_by": "popularity.desc",
-                "page": 1,
-            },
-        )
-        cards = await tmdb_cards_from_results(
-            discover.get("results", []), limit=genre_limit
-        )
-        genre_recs = [c for c in cards if c.tmdb_id != details.tmdb_id]
+    # 2) Genre recommendations (Served locally)
+    genre_recs = await local_genre_recommend(imdb_id, limit=genre_limit)
 
     return SearchBundleResponse(
         query=query,
