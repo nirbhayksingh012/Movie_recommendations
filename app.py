@@ -9,7 +9,6 @@ API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
 
 st.set_page_config(page_title="Movie Recommender", page_icon="🎬", layout="wide")
 
-
 st.markdown(
     """
 <style>
