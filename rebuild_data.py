@@ -5,7 +5,9 @@ import pickle
 import pandas as pd
 # pyrefly: ignore [missing-import]
 import numpy as np
+# pyrefly: ignore [missing-import]
 import nltk
+# pyrefly: ignore [missing-import]
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 from sklearn.feature_extraction.text import TfidfVectorizer
