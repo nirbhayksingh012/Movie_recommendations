@@ -21,7 +21,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# =============================
 if "view" not in st.session_state:
     st.session_state.view = "home"  # home | details
 if "selected_imdb_id" not in st.session_state:
