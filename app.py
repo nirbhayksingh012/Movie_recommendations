@@ -21,7 +21,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# =============================
 # STATE + ROUTING (single-file pages)
 # =============================
 if "view" not in st.session_state:
