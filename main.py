@@ -17,7 +17,6 @@ from pydantic import BaseModel
 # pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 
-
 # =========================
 # ENV
 # =========================
