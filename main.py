@@ -21,7 +21,6 @@ from dotenv import load_dotenv
 # =========================
 load_dotenv()
 OMDB_API_KEY = os.getenv("OMDB_API_KEY")
-
 OMDB_BASE = "http://www.omdbapi.com/"
 
 if not OMDB_API_KEY:
