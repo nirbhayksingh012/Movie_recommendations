@@ -10,6 +10,7 @@ import pandas as pd
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+# pyrefly: ignore [missing-import]
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
