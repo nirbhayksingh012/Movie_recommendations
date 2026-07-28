@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 # pyrefly: ignore [missing-import]
 from pydantic import BaseModel
+# pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 
 
