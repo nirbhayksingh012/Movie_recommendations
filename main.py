@@ -16,9 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 # pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
-# =========================
-# ENV
-# =========================
+
 load_dotenv()
 OMDB_API_KEY = os.getenv("OMDB_API_KEY")
 OMDB_BASE = "http://www.omdbapi.com/"
