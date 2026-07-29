@@ -23,7 +23,6 @@ load_dotenv()
 OMDB_API_KEY = os.getenv("OMDB_API_KEY")
 OMDB_BASE = "http://www.omdbapi.com/"
 if not OMDB_API_KEY:
-    # Don't crash import-time in production if you prefer; but for you better fail early:
     raise RuntimeError("OMDB_API_KEY missing. Put it in .env as OMDB_API_KEY=xxxx")
 
 app = FastAPI(title="Movie Recommender API", version="3.0")
