@@ -33,7 +33,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # =========================
 # PICKLE GLOBALS
 # =========================
