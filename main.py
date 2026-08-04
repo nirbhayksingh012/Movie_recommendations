@@ -33,7 +33,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 # PICKLE GLOBALS
-# =========================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DF_PATH = os.path.join(BASE_DIR, "df.pkl")
